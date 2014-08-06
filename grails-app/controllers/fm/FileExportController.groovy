@@ -4,6 +4,16 @@ import org.transmart.biomart.Experiment
 
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import org.transmart.mongo.MongoUtils
+import com.mongodb.Mongo
+import com.mongodb.DB
+import com.mongodb.MongoClient
+import com.mongodb.gridfs.GridFS
+import com.mongodb.gridfs.GridFSDBFile
+import fm.FmFile
+import groovyx.net.http.ContentType
+import groovyx.net.http.HTTPBuilder
+import groovyx.net.http.Method
 
 class FileExportController {
 
@@ -72,6 +82,7 @@ class FileExportController {
 
         def errorResponse = []
         def filestorePath = grailsApplication.config.com.recomdata.FmFolderService.filestoreDirectory
+        def useMongo = grailsApplication.config.fr.sanofi.mongoFiles.enableMongo
 
         def metadataExported = new HashSet();
         try {
@@ -88,67 +99,94 @@ class FileExportController {
                 FmFile fmFile = FmFile.get(f)
                 def fileLocation = filestorePath + "/" + fmFile.filestoreLocation + "/" + fmFile.filestoreName
                 File file = new File(fileLocation)
-                if (file.exists()) {
-
-                    //Construct a file name out of the display name + suffix, if needed
-                    def exportName = fmFile.displayName;
-                    if (!exportName.endsWith("." + fmFile.fileType)) {
-                        exportName += "." + fmFile.fileType
-                    }
-
-                    String dirName = fmFolderService.getPath(fmFile.folder, true)
-                    if (dirName.startsWith("/") || dirName.startsWith("\\")) {
-                        dirName = dirName.substring(1)
-                    }
-                    //Lose the first separator character, this would cause a blank folder name in the zip
-                    def fileEntry = new ZipEntry(dirName + "/" + fmFolderService.safeFileName(exportName))
-                    zipStream.putNextEntry(fileEntry)
-                    file.withInputStream({ is -> zipStream << is })
-                    zipStream.closeEntry()
-
-                    //For manifest files, add this file to a map, keyed by folder names.
-                    def manifestList = []
-                    if (manifestMap.containsKey(dirName)) {
-                        manifestList = manifestMap.get(dirName)
-                    }
-
-                    manifestList.push(fmFile)
-                    manifestMap.put(dirName, manifestList)
-
-                    //for each folder of the hieararchy of the file path, add file with metadata
-                    def path = fmFile.folder.folderFullName
-                    if (metadataExported.add(path)) exportMetadata(path, zipStream);
-
-                } else {
+                String dirName = fmFolderService.getPath(fmFile.folder, true)
+                if (dirName.startsWith("/") || dirName.startsWith("\\")) {
+                    dirName = dirName.substring(1)
+                } //Lose the first separator character, this would cause a blank folder name in the zip
+                def fileEntry = new ZipEntry(dirName + "/" + fmFolderService.safeFileName(fmFile.displayName))
+                zipStream.putNextEntry(fileEntry)
+                if(!useMongo){
+                    if (file.exists()) {
+                        file.withInputStream({ is -> zipStream << is })
+                    } else {
                     def errorMessage = "File not found for export: " + fileLocation
                     log.error errorMessage
                     errorResponse += errorMessage
-                }
-
-                //Now for each item in the manifest map, create a manifest file and add it to the ZIP.
-                def keyset = manifestMap.keySet()
-                for (key in keyset) {
-                    def manifestEntry = new ZipEntry(key + "/" + "manifest.txt")
-                    zipStream.putNextEntry(manifestEntry)
-                    def manifestList = manifestMap.get(key)
-                    zipStream.write((String.format("%60s%5s%15s\n", "File Name", "Type", "Size")).getBytes())
-                    zipStream.write("--------------------------------------------------------------------------------\n".getBytes())
-                    for (fmFileIt in manifestList) {
-                        zipStream.write((String.format("%60s%5s%15d\n", fmFileIt.displayName, fmFileIt.fileType, fmFileIt.fileSize)).getBytes())
                     }
-                    zipStream.closeEntry()
+                } else{
+                    if(grailsApplication.config.fr.sanofi.mongoFiles.useDriver){
+                        MongoClient mongo = new MongoClient(grailsApplication.config.fr.sanofi.mongoFiles.dbServer, grailsApplication.config.fr.sanofi.mongoFiles.dbPort)
+                        DB db = mongo.getDB( grailsApplication.config.fr.sanofi.mongoFiles.dbName)
+                        GridFS gfs = new GridFS(db)
+                        GridFSDBFile gfsFile = gfs.findOne(fmFile.filestoreName)
+                        if(gfsFile==null){
+                            def errorMessage = "File not found for export: " + fileLocation
+                            log.error errorMessage
+                            errorResponse += errorMessage
+                        }else{
+                            zipStream << gfsFile.getInputStream()
+                        }
+                        mongo.close()
+                    }else{
+                        def apiURL = grailsApplication.config.fr.sanofi.mongoFiles.apiURL
+                        def apiKey = grailsApplication.config.fr.sanofi.mongoFiles.apiKey
+                        def http = new HTTPBuilder(apiURL+fmFile.filestoreName+"/fsfile")
+                        http.request( Method.GET, ContentType.BINARY) { req ->
+                            headers.'apikey' = MongoUtils.hash(apiKey)
+                            response.success = { resp, binary ->
+                                assert resp.statusLine.statusCode == 200
+                                def inputStream = binary
+                                byte[] dataBlock = new byte[1024];
+                                int count = inputStream.read(dataBlock, 0, 1024);
+                                while (count != -1) {
+                                    zipStream.write(dataBlock, 0, count);
+                                    count = inputStream.read(dataBlock, 0, 1024);
+                                }
+                            }
+                            response.failure = { resp ->
+                                def errorMessage = "File not found for export: " + fmFile.filestoreName
+                                log.error("Problem during connection to API: "+resp.status)
+                                render(contentType: "text/plain", text: "Error writing ZIP: File not found")
+                            }
+                        }
+                    }
+                }
+                zipStream.closeEntry()
+
+                //For manifest files, add this file to a map, keyed by folder names.
+                def manifestList = []
+                if (manifestMap.containsKey(dirName)) {
+                    manifestList = manifestMap.get(dirName)
                 }
 
-                zipStream.flush();
-                zipStream.close();
+                manifestList.push(fmFile)
+                manifestMap.put(dirName, manifestList)
 
-                response.setHeader('Content-disposition', 'attachment; filename=export.zip')
-                response.contentType = 'application/zip'
-                response.outputStream << baos.toByteArray()
-                response.outputStream.flush()
+                //for each folder of the hieararchy of the file path, add file with metadata
+                def path = fmFile.folder.folderFullName
+                if (metadataExported.add(path)) exportMetadata(path, zipStream);
+
             }
-        }
-        catch (Exception e) {
+            //Now for each item in the manifest map, create a manifest file and add it to the ZIP.
+            def keyset = manifestMap.keySet()
+            for (key in keyset) {
+                def manifestEntry = new ZipEntry(key + "/" + "manifest.txt")
+                zipStream.putNextEntry(manifestEntry)
+                def manifestList = manifestMap.get(key)
+                for (fmFile in manifestList) {
+                    zipStream.write((fmFile.displayName + "\t" + fmFile.fileType + "\t" + fmFile.fileSize + "\n").getBytes())
+                }
+                zipStream.closeEntry()
+            }
+
+            zipStream.flush();
+            zipStream.close();
+
+            response.setHeader('Content-disposition', 'attachment; filename=export.zip')
+            response.contentType = 'application/zip'
+            response.outputStream << baos.toByteArray()
+            response.outputStream.flush()
+        }catch (Exception e) {
             log.error("Error writing ZIP", e)
             render(contentType: "text/plain", text: errorResponse.join("\n") + "\nError writing ZIP: " + e.getMessage())
         } catch (OutOfMemoryError oe ) {

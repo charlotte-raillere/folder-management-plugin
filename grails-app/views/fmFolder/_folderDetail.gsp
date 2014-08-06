@@ -39,6 +39,7 @@
 
 <div style="margin:10px;padding:10px;">
 <g:hiddenField name="parentId" value="${folder?.parentId}" />
+<g:hiddenField name="folderName" value="${folder.folderName}" /> 
 
 <div>
 	<div style="float: right">
